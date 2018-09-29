@@ -13,10 +13,12 @@ use std::sync::mpsc;
 use std::sync::{Mutex, Arc};
 use std::time::Duration;
 use std::thread;
+
 use threadpool::ThreadPool;
 
 const DEFAULT_PORT: u16 = 8181;
 const NUM_WORKERS: usize = 4;
+const MAX_WAITING: usize = 16;
 
 const OP_GET: u8 = 0x00;
 const OP_PUT: u8 = 0x01;
@@ -64,14 +66,35 @@ fn main() -> io::Result<()> {
 
     let map = HashMap::new();
     let maplock = Arc::new(Mutex::new(map));
-    let pool = ThreadPool::new(NUM_WORKERS);
+    // let pool = ThreadPool::new(NUM_WORKERS);
 
-    // let (tx, rx) = mpsc::channel();
-    // let worker = thread::spawn(move || {
-    //     for stream in rx {
-    //         handle(&mut map, stream).expect("Error.");
-    //     }
-    // });
+    let (tx, rx) = mpsc::sync_channel(MAX_WAITING);
+    let queue_front = Arc::new(Mutex::new(rx));
+    let queue_back = Arc::new(Mutex::new(tx));
+    let mut workers = Vec::with_capacity(NUM_WORKERS);
+    for i in 0..NUM_WORKERS {
+        let maplock = maplock.clone();
+        let queue_front = queue_front.clone();
+        let queue_back = queue_back.clone();
+        let thread_builder = thread::Builder::new().name(format!("worker-{}", i));
+        let worker = thread_builder.spawn(move || {
+            loop {
+                let rx = queue_front.lock();
+                let stream = rx.unwrap().recv().unwrap();
+                match handle_conn(maplock.clone(), &stream) {
+                    Ok(()) => {
+                        let tx = queue_back.lock();
+                        tx.unwrap().send(stream).expect("Failed to queue stream.");
+                    }
+                    Err(e) => match e.kind() {
+                        ErrorKind::ConnectionAborted => (),
+                        _ => return Err(e).expect("Error.")
+                    }
+                }
+            }
+        }).expect("failed to create worker thread.");
+        workers.push(worker);
+    }
 
     println!("Listening on port {:}", port);
     let listener = TcpListener::bind(("localhost", port))?;
@@ -85,45 +108,49 @@ fn main() -> io::Result<()> {
                 let peer = stream.peer_addr()?;
                 println!("Accepted connection from {:?}", peer);
             }
-            let maplock = Arc::clone(&maplock);
-            pool.execute(move || {
-                match handle_conn(maplock, stream) {
-                    _ => println!("connection closed"),
-                };
-            });
+            let tx = queue_back.lock();
+            tx.unwrap().send(stream).expect("Failed to queue stream.");
+            // let maplock = Arc::clone(&maplock);
+            // pool.execute(move || {
+            //     match handle_conn(maplock, stream) {
+            //         _ => println!("connection closed"),
+            //     };
+            // });
         }
     }
 
     Ok(())
 }
 
-fn handle_conn(map: MapType, mut stream: TcpStream) -> io::Result<()> {
-    loop {
-        println!("start parsing msg from {:?}", stream.peer_addr()?);
-        let mut buf: [u8; 3] = [0; 3];
-        let bytes_read = stream.read(&mut buf)?;
-        if bytes_read < 3 {
-            return Err(Error::new(ErrorKind::Other, "Incomplete message."));
-        }
-        println!("rcv ({:}): {:X?}", bytes_read, buf);
-        let len = (256 * buf[0] as u32 + buf[1] as u32) as usize;
-        println!("len = {:?}", len);
-        let mut msgbuf = Vec::with_capacity(len);
-        unsafe { msgbuf.set_len(len) };
-        let bytes_read = stream.read(&mut msgbuf[..])?;
-        unsafe { msgbuf.set_len(bytes_read) };
-        println!("rcv ({:}): {:X?}", bytes_read, msgbuf);
-
-        let pkg = build_pkg(buf, msgbuf);
-
-        match buf[2] {
-            OP_GET => handle_get(&map, &stream, pkg)?,
-            OP_PUT => handle_put(&map, &stream, pkg)?,
-            // OP_DEL => handle_del(stream, &msgbuf[..]),
-            _ => return Err(Error::new(ErrorKind::Other, format!("Invalid OP: {:X?}", buf[2]))),
-        }
-        thread::sleep(Duration::from_millis(500));
+fn handle_conn(map: MapType, mut stream: &TcpStream) -> io::Result<()> {
+    let mut buf: [u8; 3] = [0; 3];
+    let bytes_read = stream.read(&mut buf)?;
+    if bytes_read == 0 {
+        println!("no bytes read.");
+        return Err(Error::new(ErrorKind::ConnectionAborted, "EOF."));
+    } else if bytes_read < 3 {
+        return Err(Error::new(ErrorKind::Other, "Incomplete message."));
     }
+    println!("{:?}: start parsing msg from {:?}", thread::current().name().unwrap_or("unknown thread"), stream.peer_addr()?);
+    println!("rcv ({:}): {:X?}", bytes_read, buf);
+    let len = (256 * buf[0] as u32 + buf[1] as u32) as usize;
+    println!("len = {:?}", len);
+    let mut msgbuf = Vec::with_capacity(len);
+    unsafe { msgbuf.set_len(len) };
+    let bytes_read = stream.read(&mut msgbuf[..])?;
+    unsafe { msgbuf.set_len(bytes_read) };
+    println!("rcv ({:}): {:X?}", bytes_read, msgbuf);
+
+    let pkg = build_pkg(buf, msgbuf);
+
+    match buf[2] {
+        OP_GET => handle_get(&map, &stream, pkg)?,
+        OP_PUT => handle_put(&map, &stream, pkg)?,
+        // OP_DEL => handle_del(stream, &msgbuf[..]),
+        _ => return Err(Error::new(ErrorKind::Other, format!("Invalid OP: {:X?}", buf[2]))),
+    }
+    thread::sleep(Duration::from_millis(500));
+    Ok(())
 }
 
 fn handle_get(maplock: &MapType, mut stream: &TcpStream, pkg: RcPackage) -> io::Result<()> {
