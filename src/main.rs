@@ -16,6 +16,8 @@ use std::thread;
 
 use threadpool::ThreadPool;
 
+mod msg;
+
 const DEFAULT_PORT: u16 = 8181;
 const NUM_WORKERS: usize = 4;
 const MAX_WAITING: usize = 16;
