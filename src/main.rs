@@ -24,7 +24,7 @@ const MAX_WAITING: usize = 16;
 
 const OP_GET: u8 = 0x00;
 const OP_PUT: u8 = 0x01;
-const OP_DEL: u8 = 0x02;
+// const OP_DEL: u8 = 0x02;
 
 type MapType = Arc<Mutex<HashMap<Vec<u8>, RcPackage>>>;
 
